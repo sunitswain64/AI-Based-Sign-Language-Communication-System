@@ -2,41 +2,48 @@ import streamlit as st
 import cv2
 import mediapipe as mp
 import pickle
-import pyttsx3
 import speech_recognition as sr
 import time
+import threading
+import pyttsx3
+import numpy as np
+from collections import Counter
 
-# ---------------- PAGE CONFIG ----------------
-st.set_page_config(
-    page_title="Sign Language AI",
-    page_icon="🤟",
-    layout="wide"
-)
-
+# ---------------- CONFIG ----------------
+st.set_page_config(page_title="Sign Language AI", page_icon="🤟", layout="wide")
 st.title("🤟 Sign Language Communication Dashboard")
 
-# ---------------- LOAD MODEL ----------------
+# ---------------- MODEL ----------------
 model = pickle.load(open("gesture_model.pkl", "rb"))
 
-# ---------------- TEXT TO SPEECH ----------------
-engine = pyttsx3.init()
-engine.setProperty('rate', 250)
+# ---------------- SAFE TTS ----------------
+def create_engine():
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 170)
+    return engine
 
 def speak(text):
-    engine.say(text)
-    engine.runAndWait()
+    if text.strip() == "":
+        return
+    try:
+        engine = create_engine()
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+    except:
+        pass
+
+def speak_async(text):
+    threading.Thread(target=speak, args=(text,), daemon=True).start()
 
 # ---------------- MEDIAPIPE ----------------
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands()
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 draw = mp.solutions.drawing_utils
 
-# ---------------- SESSION STATE ----------------
+# ---------------- SESSION ----------------
 if "sentence" not in st.session_state:
     st.session_state.sentence = []
-
-if "current_gesture" not in st.session_state:
-    st.session_state.current_gesture = ""
 
 if "camera_on" not in st.session_state:
     st.session_state.camera_on = False
@@ -44,126 +51,184 @@ if "camera_on" not in st.session_state:
 if "cap" not in st.session_state:
     st.session_state.cap = None
 
-# ---------------- LAYOUT ----------------
-col1, col2 = st.columns([3,1])
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-# ---------------- CAMERA PANEL ----------------
-with col1:
-    st.subheader("📷 Live Camera Feed")
-    FRAME_WINDOW = st.empty()
+if "last_spoken" not in st.session_state:
+    st.session_state.last_spoken = ""
 
-# ---------------- CONTROLS ----------------
-with col2:
-    st.subheader("🖐 Detected Gesture")
+if "prediction_buffer" not in st.session_state:
+    st.session_state.prediction_buffer = []
 
-    if st.button("📷 Start Camera"):
-        st.session_state.camera_on = True
-        st.session_state.cap = cv2.VideoCapture(0)
+if "current_gesture" not in st.session_state:
+    st.session_state.current_gesture = ""
 
-    if st.button("🛑 Stop Camera"):
-        st.session_state.camera_on = False
+# ---------------- MODE ----------------
+mode = st.radio("Select Mode", ["Gesture", "Voice", "Text"])
 
-    # ✅ ADD GESTURE + AUTO SPEAK WORD
-    if st.button("✅ Add Gesture"):
-        if st.session_state.current_gesture not in ["None", ""]:
-            st.session_state.sentence.append(st.session_state.current_gesture)
+# =====================================================
+# ================== GESTURE MODE ======================
+# =====================================================
+if mode == "Gesture":
 
-            # 🔊 SPEAK FULL WORD
-            full_text = "".join(st.session_state.sentence)
-            speak(full_text)
+    col1, col2 = st.columns([3,1])
 
-    # ✅ SPACE BUTTON
-    if st.button("␣ Add Space"):
-        st.session_state.sentence.append(" ")
+    with col1:
+        st.subheader("📷 Live Camera Feed")
+        FRAME_WINDOW = st.empty()
 
-    gesture_display = st.empty()
+    with col2:
+        # ✅ ORDER FIXED
+        if st.button("📷 Start Camera"):
+            st.session_state.camera_on = True
+            st.session_state.cap = cv2.VideoCapture(0)
+            st.session_state.last_spoken = ""
 
-# ---------------- CAMERA LOOP ----------------
-if st.session_state.camera_on:
+        if st.button("🛑 Stop Camera"):
+            st.session_state.camera_on = False
+            if st.session_state.cap is not None:
+                st.session_state.cap.release()
+                st.session_state.cap = None
 
-    if st.session_state.cap is None:
-        st.session_state.cap = cv2.VideoCapture(0)
+        if st.button("➕ Add Gesture"):
+            g = st.session_state.current_gesture
+            if g not in ["NONE", ""]:
+                st.session_state.sentence.append(g)
 
-    cap = st.session_state.cap
+        # ✅ NEW SPACE BUTTON
+        if st.button("␣ Space"):
+            st.session_state.sentence.append(" ")
 
-    while st.session_state.camera_on:
+        gesture_display = st.empty()
 
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Camera not working")
-            break
+    # -------- CAMERA LOOP --------
+    if st.session_state.camera_on:
 
-        frame = cv2.flip(frame, 1)
+        cap = st.session_state.cap
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
+        while st.session_state.camera_on:
 
-        prediction = "None"
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if result.multi_hand_landmarks:
-            for hand in result.multi_hand_landmarks:
-                data = []
-                for lm in hand.landmark:
-                    data.extend([lm.x, lm.y])
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = hands.process(rgb)
 
-                prediction = model.predict([data])[0]
+            prediction = "NONE"
 
-                draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+            if result.multi_hand_landmarks:
+                for hand in result.multi_hand_landmarks:
 
-                cv2.putText(frame, prediction, (30, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1,
-                            (0, 255, 0), 2)
+                    x_list, y_list, z_list = [], [], []
 
-        st.session_state.current_gesture = prediction
+                    for lm in hand.landmark:
+                        x_list.append(lm.x)
+                        y_list.append(lm.y)
+                        z_list.append(lm.z)
 
-        FRAME_WINDOW.image(frame, channels="BGR", use_container_width=True)
-        gesture_display.metric("Detected Gesture", prediction)
+                    min_x, min_y, min_z = min(x_list), min(y_list), min(z_list)
 
-        time.sleep(0.03)
+                    row = []
+                    for lm in hand.landmark:
+                        row.append(lm.x - min_x)
+                        row.append(lm.y - min_y)
+                        row.append(lm.z - min_z)
 
-        if not st.session_state.camera_on:
-            break
+                    max_val = max(row)
+                    if max_val != 0:
+                        row = [i / max_val for i in row]
 
-    cap.release()
-    st.session_state.cap = None
+                    prediction = model.predict([row])[0]
 
-# ---------------- SENTENCE DISPLAY ----------------
-st.subheader("📝 Sentence")
-st.write("".join(st.session_state.sentence))
+                    draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
-# ---------------- CONTROLS ----------------
-colA, colB = st.columns(2)
+                    cv2.putText(frame, prediction, (30, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1,
+                                (0, 255, 0), 2)
+            else:
+                prediction = "NONE"
+                st.session_state.prediction_buffer.clear()
 
-with colA:
-    if st.button("🔊 Speak Sentence"):
-        speak("".join(st.session_state.sentence))
+            # -------- STABILITY FILTER --------
+            st.session_state.prediction_buffer.append(prediction)
+            if len(st.session_state.prediction_buffer) > 4:
+                st.session_state.prediction_buffer.pop(0)
 
-with colB:
-    if st.button("🗑 Clear Sentence"):
-        st.session_state.sentence.clear()
+            stable_prediction = Counter(st.session_state.prediction_buffer).most_common(1)[0][0]
+            st.session_state.current_gesture = stable_prediction
 
-# ---------------- TEXT TO SPEECH ----------------
-st.subheader("🔊 Text to Speech")
+            # -------- SPEAK --------
+            if stable_prediction != "NONE":
+                if stable_prediction != st.session_state.last_spoken:
+                    speak_async(stable_prediction)
+                    st.session_state.last_spoken = stable_prediction
 
-text_input = st.text_input("Enter text")
+            # -------- HISTORY --------
+            if stable_prediction != "NONE":
+                if len(st.session_state.history) == 0 or \
+                   st.session_state.history[-1] != stable_prediction:
+                    st.session_state.history.append(stable_prediction)
 
-if st.button("Speak Text"):
-    if text_input:
-        speak(text_input)
+            st.session_state.history = st.session_state.history[-5:]
 
-# ---------------- SPEECH TO TEXT ----------------
-st.subheader("🎤 Speech to Text")
+            FRAME_WINDOW.image(frame, channels="BGR", use_container_width=True)
+            gesture_display.metric("Gesture", stable_prediction)
 
-if st.button("Start Listening"):
-    recognizer = sr.Recognizer()
+            time.sleep(0.03)
 
-    with sr.Microphone() as source:
-        st.write("Listening... Speak now")
-        recognizer.adjust_for_ambient_noise(source)
+            if not st.session_state.camera_on:
+                break
 
-        try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
-            text = recognizer.recognize_google(audio)
-            st.success("You said: " + text)
-        except:
-            st.error("Speech recognition failed")
+    # -------- SENTENCE --------
+    st.subheader("📝 Sentence")
+    st.write("".join(st.session_state.sentence))
+
+    colA, colB, colC = st.columns(3)
+
+    with colA:
+        if st.button("🔊 Speak Sentence"):
+            sentence = "".join(st.session_state.sentence)
+            if sentence.strip() != "":
+                speak_async(sentence)
+
+    with colB:
+        if st.button("🗑 Clear Sentence"):
+            st.session_state.sentence.clear()
+
+    with colC:
+        if st.button("⬅ Delete Last"):
+            if len(st.session_state.sentence) > 0:
+                st.session_state.sentence.pop()
+
+# =====================================================
+# ================== VOICE MODE ========================
+# =====================================================
+elif mode == "Voice":
+
+    st.subheader("🎤 Speech to Text")
+
+    if st.button("Start Listening"):
+        recognizer = sr.Recognizer()
+
+        with sr.Microphone() as source:
+            st.write("Listening...")
+            try:
+                audio = recognizer.listen(source, timeout=5)
+                text = recognizer.recognize_google(audio)
+                st.success("You said: " + text)
+            except:
+                st.error("Speech recognition failed")
+
+# =====================================================
+# ================== TEXT MODE =========================
+# =====================================================
+elif mode == "Text":
+
+    st.subheader("⌨️ Text to Speech")
+
+    text_input = st.text_input("Enter text")
+
+    if st.button("Speak Text"):
+        speak_async(text_input)
